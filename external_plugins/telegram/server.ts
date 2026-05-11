@@ -87,10 +87,16 @@ function rotateLog(): void {
   try { renameSync(LOG_FILE, `${LOG_FILE}.1`) } catch {}
   openLog()
 }
+// bot_id is the numeric prefix of the bot token (Telegram convention).
+// Stamped on every log line so a multi-bot install (cowork, raft, dungeon
+// each polling their own bot) is unambiguous in any individual log entry
+// — boot lines rotate out under load, so joining against plugin.start
+// isn't reliable.
+const BOT_ID = process.env.TELEGRAM_BOT_TOKEN?.split(':')[0]
 function log(event: string, fields: Record<string, unknown> = {}): void {
   if (logFd == null) return
   try {
-    const line = JSON.stringify({ ts: Date.now(), event, ...fields }) + '\n'
+    const line = JSON.stringify({ ts: Date.now(), bot_id: BOT_ID, event, ...fields }) + '\n'
     writeSync(logFd, line)
     logBytes += line.length
     if (logBytes > LOG_ROTATE_BYTES) rotateLog()
@@ -99,16 +105,11 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
   }
 }
 openLog()
-// bot_id is the numeric prefix of the bot token (Telegram convention).
-// Logging it at boot catches token/identity drift in a single line — if
-// the deployed bot's id changes between sessions, that's visible in
-// plugin.log without needing a separate getMe round-trip.
-const BOT_ID = process.env.TELEGRAM_BOT_TOKEN?.split(':')[0]
-log('plugin.start', { pid: process.pid, ppid: process.ppid, bot_id: BOT_ID })
+log('plugin.start', { pid: process.pid, ppid: process.ppid })
 process.on('exit', code => {
   if (logFd != null) {
     try {
-      writeSync(logFd, JSON.stringify({ ts: Date.now(), event: 'plugin.exit', code }) + '\n')
+      writeSync(logFd, JSON.stringify({ ts: Date.now(), bot_id: BOT_ID, event: 'plugin.exit', code }) + '\n')
       closeSync(logFd)
     } catch {}
     logFd = null
