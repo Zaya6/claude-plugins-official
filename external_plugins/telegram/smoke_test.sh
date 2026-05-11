@@ -25,6 +25,13 @@ trap 'rm -rf "$SMOKE_DIR"' EXIT
 echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_SMOKE_TOKEN" > "$SMOKE_DIR/.env"
 chmod 600 "$SMOKE_DIR/.env"
 
+# The server.ts .env loader is non-overriding (process.env wins), so if the
+# caller's environment already has TELEGRAM_BOT_TOKEN set the plugin would
+# silently use that instead of the sandbox token — exactly the bug Patch 1
+# is trying to expose elsewhere. Explicitly unset+export to bind cleanly.
+unset TELEGRAM_BOT_TOKEN
+export TELEGRAM_BOT_TOKEN="$TELEGRAM_SMOKE_TOKEN"
+
 # Hold stdin open 4s via `sleep` redirected in — plugin will see EOF when sleep exits.
 TELEGRAM_STATE_DIR="$SMOKE_DIR" \
   bun "$SCRIPT_DIR/server.ts" < <(sleep 4) > "$SMOKE_DIR/stdout.log" 2> "$SMOKE_DIR/stderr.log" &

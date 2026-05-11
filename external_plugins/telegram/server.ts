@@ -99,7 +99,12 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
   }
 }
 openLog()
-log('plugin.start', { pid: process.pid, ppid: process.ppid })
+// bot_id is the numeric prefix of the bot token (Telegram convention).
+// Logging it at boot catches token/identity drift in a single line — if
+// the deployed bot's id changes between sessions, that's visible in
+// plugin.log without needing a separate getMe round-trip.
+const BOT_ID = process.env.TELEGRAM_BOT_TOKEN?.split(':')[0]
+log('plugin.start', { pid: process.pid, ppid: process.ppid, bot_id: BOT_ID })
 process.on('exit', code => {
   if (logFd != null) {
     try {
@@ -131,6 +136,29 @@ process.on('unhandledRejection', err => {
 process.on('uncaughtException', err => {
   process.stderr.write(`telegram channel: uncaught exception: ${err}\n`)
 })
+
+// Classifies a thrown error from grammy or the network layer into a
+// stable failure-kind tag. Lets callers (tool-call catch sites, the
+// polling retry loop) react on category instead of error-string regex,
+// and gives the persistent log a typed field for analysis.
+type FailureKind = 'network' | 'auth' | 'rate_limit' | 'malformed' | 'server' | 'unknown'
+function classifyFailure(err: unknown): { kind: FailureKind; code?: number; message: string } {
+  const message = err instanceof Error ? err.message : String(err)
+  if (err instanceof GrammyError) {
+    const code = err.error_code
+    if (code === 401 || code === 403) return { kind: 'auth', code, message }
+    if (code === 429) return { kind: 'rate_limit', code, message }
+    if (code === 400 || code === 404) return { kind: 'malformed', code, message }
+    if (code === 409) return { kind: 'server', code, message } // poller conflict — transient
+    if (code >= 500) return { kind: 'server', code, message }
+    return { kind: 'unknown', code, message }
+  }
+  const m = message.toLowerCase()
+  if (/etimedout|econnreset|enotfound|econnrefused|eai_again|socket hang up|network|fetch failed/.test(m)) {
+    return { kind: 'network', message }
+  }
+  return { kind: 'unknown', message }
+}
 
 // Permission-reply spec from anthropics/claude-cli-internal
 // src/services/mcp/channelPermissions.ts — inlined (no CC repo dep).
@@ -695,10 +723,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    log('outbound.failure', { tool: req.params.name, chat_id: typeof args.chat_id === 'string' ? args.chat_id : undefined, error: msg })
+    const classified = classifyFailure(err)
+    log('outbound.failure', {
+      tool: req.params.name,
+      chat_id: typeof args.chat_id === 'string' ? args.chat_id : undefined,
+      kind: classified.kind,
+      code: classified.code,
+      error: classified.message,
+    })
     return {
-      content: [{ type: 'text', text: `${req.params.name} failed: ${msg}` }],
+      content: [{ type: 'text', text: `${req.params.name} failed: ${classified.message}` }],
       isError: true,
     }
   }
@@ -1092,7 +1126,8 @@ async function handleInbound(
 bot.catch(err => {
   const chat_id = err.ctx?.chat?.id != null ? String(err.ctx.chat.id) : undefined
   const message_id = err.ctx?.message?.message_id
-  log('bot_handler.error', { chat_id, message_id, error: String(err.error) })
+  const classified = classifyFailure(err.error)
+  log('bot_handler.error', { chat_id, message_id, kind: classified.kind, code: classified.code, error: classified.message })
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
@@ -1130,10 +1165,9 @@ void (async () => {
       // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
       if (err instanceof Error && err.message === 'Aborted delay') return
       const is409 = err instanceof GrammyError && err.error_code === 409
-      const errorClass = err instanceof GrammyError ? 'grammy' : err instanceof Error ? err.constructor.name : 'unknown'
-      const errorCode = err instanceof GrammyError ? err.error_code : undefined
+      const classified = classifyFailure(err)
       if (is409 && attempt >= 8) {
-        log('polling.error', { attempt, error_class: errorClass, error_code: errorCode, error: String(err), fatal: true })
+        log('polling.error', { attempt, kind: classified.kind, code: classified.code, error: classified.message, fatal: true })
         process.stderr.write(
           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
           `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
@@ -1141,7 +1175,7 @@ void (async () => {
         return
       }
       const delay = Math.min(1000 * attempt, 15000)
-      log('polling.error', { attempt, error_class: errorClass, error_code: errorCode, error: String(err), retry_delay_ms: delay })
+      log('polling.error', { attempt, kind: classified.kind, code: classified.code, error: classified.message, retry_delay_ms: delay })
       const detail = is409
         ? `409 Conflict${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
         : `polling error: ${err}`
