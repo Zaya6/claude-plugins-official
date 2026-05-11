@@ -19,7 +19,7 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, openSync, writeSync, closeSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
@@ -58,6 +58,61 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 // survive as an orphan and hold the slot forever, so every new session sees
 // 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+
+// Persistent JSON-lines log — forensic ground truth for every inbound,
+// outbound, polling-state transition, and shutdown trigger. Distinguishes
+// "message never reached plugin" from "plugin received but Claude didn't act"
+// — the silent-failure modes that previously left no trace.
+const LOG_FILE = join(STATE_DIR, 'plugin.log')
+const LOG_ROTATE_BYTES = 10 * 1024 * 1024
+const LOG_KEEP = 3
+let logFd: number | null = null
+let logBytes = 0
+function openLog(): void {
+  try {
+    logFd = openSync(LOG_FILE, 'a', 0o600)
+    logBytes = statSync(LOG_FILE).size
+  } catch {
+    logFd = null
+  }
+}
+function rotateLog(): void {
+  if (logFd != null) {
+    try { closeSync(logFd) } catch {}
+    logFd = null
+  }
+  for (let i = LOG_KEEP - 1; i >= 1; i--) {
+    try { renameSync(`${LOG_FILE}.${i}`, `${LOG_FILE}.${i + 1}`) } catch {}
+  }
+  try { renameSync(LOG_FILE, `${LOG_FILE}.1`) } catch {}
+  openLog()
+}
+function log(event: string, fields: Record<string, unknown> = {}): void {
+  if (logFd == null) return
+  try {
+    const line = JSON.stringify({ ts: Date.now(), event, ...fields }) + '\n'
+    writeSync(logFd, line)
+    logBytes += line.length
+    if (logBytes > LOG_ROTATE_BYTES) rotateLog()
+  } catch {
+    // log channel must never crash the plugin
+  }
+}
+openLog()
+log('plugin.start', { pid: process.pid, ppid: process.ppid })
+process.on('exit', code => {
+  if (logFd != null) {
+    try {
+      writeSync(logFd, JSON.stringify({ ts: Date.now(), event: 'plugin.exit', code }) + '\n')
+      closeSync(logFd)
+    } catch {}
+    logFd = null
+  }
+})
+process.stdout.on('error', err => {
+  log('mcp.stdout_error', { error: String(err) })
+})
+
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
@@ -518,6 +573,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
+  log('tool_call.entry', {
+    tool: req.params.name,
+    chat_id: typeof args.chat_id === 'string' ? args.chat_id : undefined,
+  })
   try {
     switch (req.params.name) {
       case 'reply': {
@@ -585,6 +644,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+        log('outbound.reply', { chat_id, reply_to, text_length: text.length, chunks: chunks.length, file_count: files.length, sent_ids: sentIds })
         return { content: [{ type: 'text', text: result }] }
       }
       case 'react': {
@@ -592,6 +652,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         await bot.api.setMessageReaction(args.chat_id as string, Number(args.message_id), [
           { type: 'emoji', emoji: args.emoji as ReactionTypeEmoji['emoji'] },
         ])
+        log('outbound.react', { chat_id: args.chat_id, message_id: args.message_id, emoji: args.emoji })
         return { content: [{ type: 'text', text: 'reacted' }] }
       }
       case 'download_attachment': {
@@ -610,6 +671,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
         mkdirSync(INBOX_DIR, { recursive: true })
         writeFileSync(path, buf)
+        log('outbound.download_attachment', { file_id, size: buf.length, path })
         return { content: [{ type: 'text', text: path }] }
       }
       case 'edit_message': {
@@ -623,6 +685,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           ...(editParseMode ? [{ parse_mode: editParseMode }] : []),
         )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
+        log('outbound.edit', { chat_id: args.chat_id, message_id: args.message_id, text_length: (args.text as string).length })
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
       }
       default:
@@ -633,6 +696,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
+    log('outbound.failure', { tool: req.params.name, chat_id: typeof args.chat_id === 'string' ? args.chat_id : undefined, error: msg })
     return {
       content: [{ type: 'text', text: `${req.params.name} failed: ${msg}` }],
       isError: true,
@@ -646,9 +710,12 @@ await mcp.connect(new StdioServerTransport())
 // the bot keeps polling forever as a zombie, holding the token and blocking
 // the next session with 409 Conflict.
 let shuttingDown = false
-function shutdown(): void {
+let shutdownReason: string | undefined
+function shutdown(reason: string = 'unknown'): void {
   if (shuttingDown) return
   shuttingDown = true
+  shutdownReason = reason
+  log('polling.shutdown', { reason })
   process.stderr.write('telegram channel: shutting down\n')
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
@@ -658,22 +725,34 @@ function shutdown(): void {
   setTimeout(() => process.exit(0), 2000)
   void Promise.resolve(bot.stop()).finally(() => process.exit(0))
 }
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
-process.on('SIGTERM', shutdown)
-process.on('SIGINT', shutdown)
-process.on('SIGHUP', shutdown)
+process.stdin.on('end', () => {
+  log('mcp.stdin_end', {})
+  shutdown('stdin_end')
+})
+process.stdin.on('close', () => shutdown('stdin_close'))
+process.on('SIGTERM', () => shutdown('sigterm'))
+process.on('SIGINT', () => shutdown('sigint'))
+process.on('SIGHUP', () => shutdown('sighup'))
 
 // Orphan watchdog: stdin events above don't reliably fire when the parent
 // chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
 // reparenting (POSIX) or a dead stdin pipe and self-terminate.
 const bootPpid = process.ppid
 setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) shutdown()
+  const reparented = process.platform !== 'win32' && process.ppid !== bootPpid
+  const stdinDestroyed = process.stdin.destroyed
+  const stdinReadableEnded = process.stdin.readableEnded
+  const orphaned = reparented || stdinDestroyed || stdinReadableEnded
+  if (orphaned) {
+    log('orphan_watchdog.check', {
+      reparented,
+      stdin_destroyed: stdinDestroyed,
+      stdin_readable_ended: stdinReadableEnded,
+      boot_ppid: bootPpid,
+      current_ppid: process.ppid,
+    })
+    shutdown('orphan_watchdog')
+  }
 }, 5000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
@@ -738,6 +817,7 @@ bot.on('callback_query:data', async ctx => {
   const access = loadAccess()
   const senderId = String(ctx.from.id)
   if (!access.allowFrom.includes(senderId)) {
+    log('access.rejection', { user_id: senderId, reason: 'callback_query_unauthorized' })
     await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
     return
   }
@@ -903,9 +983,28 @@ async function handleInbound(
   downloadImage: (() => Promise<string | undefined>) | undefined,
   attachment?: AttachmentMeta,
 ): Promise<void> {
+  const chat_id_log = ctx.chat ? String(ctx.chat.id) : undefined
+  const user_id_log = ctx.from ? String(ctx.from.id) : undefined
+  const message_id_log = ctx.message?.message_id
+  log('inbound.message', {
+    chat_id: chat_id_log,
+    user_id: user_id_log,
+    message_id: message_id_log,
+    content_length: text.length,
+    attachment_kind: attachment?.kind,
+  })
+
   const result = gate(ctx)
 
-  if (result.action === 'drop') return
+  if (result.action === 'drop') {
+    log('access.rejection', {
+      chat_id: chat_id_log,
+      user_id: user_id_log,
+      message_id: message_id_log,
+      reason: 'gate_drop',
+    })
+    return
+  }
 
   if (result.action === 'pair') {
     const lead = result.isResend ? 'Still pending' : 'Pairing required'
@@ -980,7 +1079,10 @@ async function handleInbound(
         } : {}),
       },
     },
-  }).catch(err => {
+  }).then(() => {
+    log('inbound.delivered_to_mcp', { chat_id, message_id: msgId })
+  }, err => {
+    log('inbound.delivered_to_mcp', { chat_id, message_id: msgId, error: String(err) })
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
   })
 }
@@ -988,6 +1090,9 @@ async function handleInbound(
 // Without this, any throw in a message handler stops polling permanently
 // (grammy's default error handler calls bot.stop() and rethrows).
 bot.catch(err => {
+  const chat_id = err.ctx?.chat?.id != null ? String(err.ctx.chat.id) : undefined
+  const message_id = err.ctx?.message?.message_id
+  log('bot_handler.error', { chat_id, message_id, error: String(err.error) })
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
@@ -998,11 +1103,16 @@ bot.catch(err => {
 // deaf to inbound messages until a full restart.
 void (async () => {
   for (let attempt = 1; ; attempt++) {
+    if (attempt > 1) log('reconnect.attempt', { attempt })
     try {
       await bot.start({
         onStart: info => {
+          const wasReconnect = attempt > 1
+          const attemptCount = attempt
           attempt = 0
           botUsername = info.username
+          log('polling.start', { username: info.username, attempt: attemptCount })
+          if (wasReconnect) log('reconnect.success', { attempt: attemptCount })
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
           void bot.api.setMyCommands(
             [
@@ -1020,7 +1130,10 @@ void (async () => {
       // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
       if (err instanceof Error && err.message === 'Aborted delay') return
       const is409 = err instanceof GrammyError && err.error_code === 409
+      const errorClass = err instanceof GrammyError ? 'grammy' : err instanceof Error ? err.constructor.name : 'unknown'
+      const errorCode = err instanceof GrammyError ? err.error_code : undefined
       if (is409 && attempt >= 8) {
+        log('polling.error', { attempt, error_class: errorClass, error_code: errorCode, error: String(err), fatal: true })
         process.stderr.write(
           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
           `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
@@ -1028,6 +1141,7 @@ void (async () => {
         return
       }
       const delay = Math.min(1000 * attempt, 15000)
+      log('polling.error', { attempt, error_class: errorClass, error_code: errorCode, error: String(err), retry_delay_ms: delay })
       const detail = is409
         ? `409 Conflict${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
         : `polling error: ${err}`
