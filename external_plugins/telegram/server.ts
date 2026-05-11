@@ -30,14 +30,30 @@ const ENV_FILE = join(STATE_DIR, '.env')
 
 // Load ~/.claude/channels/telegram/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
+// Errors are deferred to envLoadEvents and flushed once the persistent log
+// is open — a missing or corrupted .env is exactly the moment we need
+// forensic ground truth, not a silent catch.
+const envLoadEvents: Array<{ event: string; fields: Record<string, unknown> }> = []
 try {
   // Token is a credential — lock to owner. No-op on Windows (would need ACLs).
   chmodSync(ENV_FILE, 0o600)
+} catch (err) {
+  if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+    envLoadEvents.push({ event: 'env.chmod_error', fields: { error: String(err) } })
+  }
+}
+try {
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
     const m = line.match(/^(\w+)=(.*)$/)
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
   }
-} catch {}
+} catch (err) {
+  // ENOENT is fine — .env is optional if the env block already has TOKEN.
+  if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+    envLoadEvents.push({ event: 'env.load_error', fields: { error: String(err) } })
+    process.stderr.write(`telegram channel: .env load error: ${err}\n`)
+  }
+}
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
@@ -118,6 +134,8 @@ function log(event: string, fields: Record<string, unknown> = {}): void {
   }
 }
 openLog()
+// Flush any deferred env-loader events that fired before the log was open.
+for (const e of envLoadEvents) log(e.event, e.fields)
 log('plugin.start', { pid: process.pid, ppid: process.ppid })
 process.on('exit', code => {
   if (logFd != null) {
