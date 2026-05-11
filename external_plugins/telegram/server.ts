@@ -50,6 +50,19 @@ if (!TOKEN) {
   )
   process.exit(1)
 }
+
+// Bot tokens are <bot_id>:<secret>, bot_id is digits, secret is
+// [A-Za-z0-9_-]. Catching typos here saves a round-trip + the
+// 401-retry-loop spin that would otherwise happen at polling.start.
+const TOKEN_FORMAT = /^\d+:[A-Za-z0-9_-]{20,}$/
+if (!TOKEN_FORMAT.test(TOKEN)) {
+  process.stderr.write(
+    `telegram channel: TELEGRAM_BOT_TOKEN is malformed\n` +
+    `  expected format: 123456789:AAH... (digits, colon, ~35 alphanumerics)\n` +
+    `  check ${ENV_FILE} for stray whitespace or truncation\n`,
+  )
+  process.exit(1)
+}
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
@@ -1235,6 +1248,18 @@ void (async () => {
       if (err instanceof Error && err.message === 'Aborted delay') return
       const is409 = err instanceof GrammyError && err.error_code === 409
       const classified = classifyFailure(err)
+      // Auth failures (401 token revoked, 403 bot blocked) won't recover
+      // from a retry loop — the token itself is bad. Fail fast so the
+      // user knows immediately instead of waiting for the loop to spin.
+      if (classified.kind === 'auth') {
+        log('polling.error', { attempt, kind: classified.kind, code: classified.code, error: classified.message, fatal: true })
+        process.stderr.write(
+          `telegram channel: ${classified.code ?? 'auth error'} from Telegram — ` +
+          `token is revoked, invalid, or the bot has been blocked. ` +
+          `Check ${ENV_FILE} and the bot's @BotFather settings. Exiting.\n`,
+        )
+        return
+      }
       if (is409 && attempt >= 8) {
         log('polling.error', { attempt, kind: classified.kind, code: classified.code, error: classified.message, fatal: true })
         process.stderr.write(
