@@ -160,6 +160,20 @@ function classifyFailure(err: unknown): { kind: FailureKind; code?: number; mess
   return { kind: 'unknown', message }
 }
 
+// Short caller-facing hint per failure kind. Keeps tool errors actionable
+// without a separate doc lookup: tells the MCP caller whether to retry,
+// escalate to the user, or fix args before retrying.
+function failureHint(kind: FailureKind): string {
+  switch (kind) {
+    case 'network': return 'transient — safe to retry'
+    case 'rate_limit': return 'rate-limited — back off before retrying'
+    case 'server': return 'Telegram-side error — retry after a brief wait'
+    case 'auth': return 'bot may be revoked, banned, or kicked from the chat — escalate to user, do not retry'
+    case 'malformed': return 'chat_id, message_id, or content was invalid — do not retry without changes'
+    default: return ''
+  }
+}
+
 // Permission-reply spec from anthropics/claude-cli-internal
 // src/services/mcp/channelPermissions.ts — inlined (no CC repo dep).
 // 5 lowercase letters a-z minus 'l'. Case-insensitive for phone autocorrect.
@@ -731,8 +745,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       code: classified.code,
       error: classified.message,
     })
+    // Tag the error text with the classified kind so the MCP caller can
+    // branch without parsing error strings: retry on transient kinds,
+    // escalate on permanent ones, fix-and-retry on malformed.
+    const tag = classified.code != null ? `${classified.kind} ${classified.code}` : classified.kind
+    const hint = failureHint(classified.kind)
+    const trailer = hint ? ` — ${hint}` : ''
     return {
-      content: [{ type: 'text', text: `${req.params.name} failed: ${classified.message}` }],
+      content: [{ type: 'text', text: `${req.params.name} failed [${tag}]: ${classified.message}${trailer}` }],
       isError: true,
     }
   }
