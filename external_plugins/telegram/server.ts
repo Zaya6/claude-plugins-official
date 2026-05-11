@@ -183,6 +183,14 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 const bot = new Bot(TOKEN)
 let botUsername = ''
 
+// restart_polling tool lets the MCP caller recycle the bot poller when
+// it appears stalled. Flag is read by the retry loop after bot.stop()
+// resolves; cooldown prevents abuse (each restart hits Telegram's API
+// and can compound 409s if hammered).
+let restartRequested = false
+let lastRestartAt = 0
+const RESTART_COOLDOWN_MS = 10_000
+
 type PendingEntry = {
   senderId: string
   chatId: string
@@ -610,6 +618,14 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_id', 'text'],
       },
     },
+    {
+      name: 'restart_polling',
+      description: "Restart the bot's polling loop in-process (no plugin restart needed). Use when polling appears stalled — no inbound messages for an extended period despite expected traffic, or after a transient auth/network flap. 10s cooldown between restarts. Watch plugin.log for the next polling.start event to confirm recovery.",
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
   ],
 }))
 
@@ -715,6 +731,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         writeFileSync(path, buf)
         log('outbound.download_attachment', { file_id, size: buf.length, path })
         return { content: [{ type: 'text', text: path }] }
+      }
+      case 'restart_polling': {
+        const now = Date.now()
+        const sinceLast = now - lastRestartAt
+        if (lastRestartAt !== 0 && sinceLast < RESTART_COOLDOWN_MS) {
+          const remainingSec = Math.ceil((RESTART_COOLDOWN_MS - sinceLast) / 1000)
+          log('tool_call.restart_polling.rejected', { reason: 'cooldown', wait_ms: RESTART_COOLDOWN_MS - sinceLast })
+          return {
+            content: [{ type: 'text', text: `restart on cooldown — wait ${remainingSec}s before retrying` }],
+            isError: true,
+          }
+        }
+        lastRestartAt = now
+        restartRequested = true
+        log('tool_call.restart_polling', {})
+        // Fire-and-forget the stop; the retry loop will resolve from
+        // bot.start(), see restartRequested, and recycle the poller.
+        // Awaiting here would block until the long-poll request returns
+        // (up to ~30s), which is the wrong UX for a "kick it" tool.
+        void bot.stop()
+        return {
+          content: [{ type: 'text', text: 'polling restart requested — watch plugin.log for polling.start to confirm' }],
+        }
       }
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
@@ -1179,7 +1218,16 @@ void (async () => {
           ).catch(() => {})
         },
       })
-      return // bot.stop() was called — clean exit from the loop
+      // bot.start() resolved without throwing — bot.stop() was called.
+      // If a tool requested a recycle, reset and start a fresh poller.
+      // Otherwise it's a real shutdown signal — exit the loop cleanly.
+      if (restartRequested && !shuttingDown) {
+        restartRequested = false
+        log('polling.restart', { trigger: 'tool_call' })
+        attempt = 0
+        continue
+      }
+      return
     } catch (err) {
       if (shuttingDown) return
       // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
