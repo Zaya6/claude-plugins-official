@@ -1,0 +1,53 @@
+name: Telegram plugin smoke
+
+on:
+  push:
+    branches:
+      - 'telegram/**'
+    paths:
+      - 'external_plugins/telegram/**'
+      - '.github/workflows/telegram-smoke.yml'
+  pull_request:
+    paths:
+      - 'external_plugins/telegram/**'
+      - '.github/workflows/telegram-smoke.yml'
+  workflow_dispatch:
+
+# The smoke test polls Telegram briefly. Only one job at a time may hold the
+# token's getUpdates slot, so serialize across all telegram/** runs.
+concurrency:
+  group: telegram-smoke
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: external_plugins/telegram
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install plugin deps
+        run: bun install --frozen-lockfile
+
+      - name: Run smoke
+        env:
+          TELEGRAM_SMOKE_TOKEN: ${{ secrets.TELEGRAM_SMOKE_TOKEN }}
+        run: ./smoke_test.sh
+
+      - name: Upload plugin.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-log
+          path: /tmp/telegram-plugin-smoke.*/plugin.log
+          if-no-files-found: ignore
