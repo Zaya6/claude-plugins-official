@@ -846,6 +846,55 @@ await mcp.connect(new StdioServerTransport())
 // the next session with 409 Conflict.
 let shuttingDown = false
 let shutdownReason: string | undefined
+
+// SHUTDOWN_ALERT_REASONS — only fire the direct Telegram alert when the
+// shutdown is mid-session (the silent-stall pattern). Don't alert for
+// SIGTERM/SIGINT (manual stop) or sighup (terminal close).
+const SHUTDOWN_ALERT_REASONS = new Set(['stdin_end', 'stdin_close', 'orphan_watchdog'])
+
+async function fireStallAlert(reason: string): Promise<void> {
+  if (!SHUTDOWN_ALERT_REASONS.has(reason)) return
+  let allowlist: string[] = []
+  try {
+    const acc = JSON.parse(readFileSync(ACCESS_FILE, 'utf8')) as { allowlist?: Record<string, unknown> }
+    allowlist = Object.keys(acc.allowlist ?? {}).filter(k => /^\d+$/.test(k))
+  } catch (err) {
+    log('stall_alert.access_read_failed', { error: String(err) })
+    return
+  }
+  if (allowlist.length === 0) {
+    log('stall_alert.no_allowlist', {})
+    return
+  }
+  const now = Date.now()
+  const body = [
+    `⚠️ ${botUsername ?? 'telegram-channel'} plugin going down: reason=${reason}`,
+    `uptime: ${Math.round((now - PLUGIN_START_TS) / 60000)}min`,
+    `last tool call: ${lastToolCallTs ? Math.round((now - lastToolCallTs) / 60000) + 'min ago' : 'never'}`,
+    `last inbound: ${lastInboundTs ? Math.round((now - lastInboundTs) / 60000) + 'min ago' : 'never'}`,
+    lastInboundDeliveredButUnanswered
+      ? `unanswered msg ${lastInboundDeliveredButUnanswered.message_id}: ${Math.round((now - lastInboundDeliveredButUnanswered.ts) / 60000)}min`
+      : 'no unanswered inbound',
+    `please /reload-plugins or restart claude code on the host`,
+  ].join('\n')
+  // Send to all allowlisted users in parallel — sequential for-of would
+  // accumulate 2s timeouts and could exceed the 4s hard-exit window.
+  await Promise.allSettled(
+    allowlist.map(async userId => {
+      log('stall_alert.attempt', { user_id: userId, reason })
+      try {
+        const sent = await Promise.race([
+          bot.api.sendMessage(userId, body),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error('alert timeout 2s')), 2000)),
+        ])
+        log('stall_alert.sent', { user_id: userId, message_id: (sent as { message_id: number }).message_id })
+      } catch (err) {
+        log('stall_alert.failed', { user_id: userId, error: String(err) })
+      }
+    })
+  )
+}
+
 function shutdown(reason: string = 'unknown'): void {
   if (shuttingDown) return
   shuttingDown = true
@@ -855,10 +904,13 @@ function shutdown(reason: string = 'unknown'): void {
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
-  // bot.stop() signals the poll loop to end; the current getUpdates request
-  // may take up to its long-poll timeout to return. Force-exit after 2s.
-  setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+  // Fire direct Telegram alert (bypasses the dead MCP path) BEFORE we tear
+  // down the bot. The alert has a 2s internal timeout per user (parallel).
+  // Hard exit after 4s total to bound shutdown latency.
+  setTimeout(() => process.exit(0), 4000)
+  void fireStallAlert(reason)
+    .finally(() => Promise.resolve(bot.stop()))
+    .finally(() => process.exit(0))
 }
 process.stdin.on('end', () => {
   log('mcp.stdin_end', {})
