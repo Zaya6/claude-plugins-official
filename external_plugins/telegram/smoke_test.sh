@@ -25,6 +25,15 @@ trap 'rm -rf "$SMOKE_DIR"' EXIT
 echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_SMOKE_TOKEN" > "$SMOKE_DIR/.env"
 chmod 600 "$SMOKE_DIR/.env"
 
+# Write a fake access.json with a sentinel numeric user ID so that
+# fireStallAlert enters its send loop on stdin_end. The bot can't actually
+# message itself, so stall_alert.failed is expected — but stall_alert.attempt
+# MUST fire. Using a clearly-fake ID (00000) to avoid an accidental live send.
+cat > "$SMOKE_DIR/access.json" <<'EOF'
+{"allowlist":{"00000":{"approved_at":"1970-01-01T00:00:00Z"}}}
+EOF
+chmod 600 "$SMOKE_DIR/access.json"
+
 # The server.ts .env loader is non-overriding (process.env wins), so if the
 # caller's environment already has TELEGRAM_BOT_TOKEN set the plugin would
 # silently use that instead of the sandbox token — exactly the bug Patch 1
@@ -74,5 +83,30 @@ if ! awk 'NF { if (!match($0, /"ts":[0-9]+/) || !match($0, /"event":"[^"]+"/)) e
   cat "$LOG" >&2
   exit 1
 fi
+
+# Requires Task 1.2's heartbeat.tick setInterval to be in place — will fail until then.
+# Verify heartbeat fires within 75 seconds of start
+echo "--- waiting for first heartbeat.tick (max 75s) ---"
+for i in $(seq 1 75); do
+  if grep -q '"event":"heartbeat.tick"' "$SMOKE_DIR/plugin.log"; then
+    echo "heartbeat seen at $i seconds"
+    break
+  fi
+  sleep 1
+done
+grep -q '"event":"heartbeat.tick"' "$SMOKE_DIR/plugin.log" || { echo "FAIL: no heartbeat.tick in 75s"; exit 1; }
+
+# Task 1.5: verify fireStallAlert fires on stdin_end shutdown.
+# access.json was written before plugin start with a fake allowlist entry (00000).
+# stdin_end hits SHUTDOWN_ALERT_REASONS → stall_alert.attempt must appear.
+# The actual send will fail (00000 is not a real Telegram user) and that's expected.
+echo "--- testing stall_alert.attempt fires on stdin_end ---"
+grep -q '"event":"stall_alert.attempt"' "$SMOKE_DIR/plugin.log" || {
+  echo "FAIL: no stall_alert.attempt fired on stdin_end"
+  echo "--- plugin.log ---" >&2
+  cat "$SMOKE_DIR/plugin.log" >&2
+  exit 1
+}
+echo "stall_alert.attempt seen"
 
 echo "PASS: $(wc -l < "$LOG") events logged, all required events present"

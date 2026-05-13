@@ -137,6 +137,13 @@ openLog()
 // Flush any deferred env-loader events that fired before the log was open.
 for (const e of envLoadEvents) log(e.event, e.fields)
 log('plugin.start', { pid: process.pid, ppid: process.ppid })
+
+// Liveness state — used by heartbeat tick, stall-alert path, and gap detection.
+const PLUGIN_START_TS = Date.now()
+let lastToolCallTs: number = 0
+let lastInboundTs: number = 0
+let lastInboundDeliveredButUnanswered: { ts: number; message_id: number } | null = null
+
 process.on('exit', code => {
   if (logFd != null) {
     try {
@@ -663,10 +670,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
+  const _now = Date.now()
   log('tool_call.entry', {
     tool: req.params.name,
     chat_id: typeof args.chat_id === 'string' ? args.chat_id : undefined,
   })
+  lastToolCallTs = _now
+  lastInboundDeliveredButUnanswered = null
   try {
     switch (req.params.name) {
       case 'reply': {
@@ -836,6 +846,55 @@ await mcp.connect(new StdioServerTransport())
 // the next session with 409 Conflict.
 let shuttingDown = false
 let shutdownReason: string | undefined
+
+// SHUTDOWN_ALERT_REASONS — only fire the direct Telegram alert when the
+// shutdown is mid-session (the silent-stall pattern). Don't alert for
+// SIGTERM/SIGINT (manual stop) or sighup (terminal close).
+const SHUTDOWN_ALERT_REASONS = new Set(['stdin_end', 'stdin_close', 'orphan_watchdog'])
+
+async function fireStallAlert(reason: string): Promise<void> {
+  if (!SHUTDOWN_ALERT_REASONS.has(reason)) return
+  let allowlist: string[] = []
+  try {
+    const acc = JSON.parse(readFileSync(ACCESS_FILE, 'utf8')) as { allowlist?: Record<string, unknown> }
+    allowlist = Object.keys(acc.allowlist ?? {}).filter(k => /^\d+$/.test(k))
+  } catch (err) {
+    log('stall_alert.access_read_failed', { error: String(err) })
+    return
+  }
+  if (allowlist.length === 0) {
+    log('stall_alert.no_allowlist', {})
+    return
+  }
+  const now = Date.now()
+  const body = [
+    `⚠️ ${botUsername ?? 'telegram-channel'} plugin going down: reason=${reason}`,
+    `uptime: ${Math.round((now - PLUGIN_START_TS) / 60000)}min`,
+    `last tool call: ${lastToolCallTs ? Math.round((now - lastToolCallTs) / 60000) + 'min ago' : 'never'}`,
+    `last inbound: ${lastInboundTs ? Math.round((now - lastInboundTs) / 60000) + 'min ago' : 'never'}`,
+    lastInboundDeliveredButUnanswered
+      ? `unanswered msg ${lastInboundDeliveredButUnanswered.message_id}: ${Math.round((now - lastInboundDeliveredButUnanswered.ts) / 60000)}min`
+      : 'no unanswered inbound',
+    `please /reload-plugins or restart claude code on the host`,
+  ].join('\n')
+  // Send to all allowlisted users in parallel — sequential for-of would
+  // accumulate 2s timeouts and could exceed the 4s hard-exit window.
+  await Promise.allSettled(
+    allowlist.map(async userId => {
+      log('stall_alert.attempt', { user_id: userId, reason })
+      try {
+        const sent = await Promise.race([
+          bot.api.sendMessage(userId, body),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error('alert timeout 2s')), 2000)),
+        ])
+        log('stall_alert.sent', { user_id: userId, message_id: (sent as { message_id: number }).message_id })
+      } catch (err) {
+        log('stall_alert.failed', { user_id: userId, error: String(err) })
+      }
+    })
+  )
+}
+
 function shutdown(reason: string = 'unknown'): void {
   if (shuttingDown) return
   shuttingDown = true
@@ -845,10 +904,13 @@ function shutdown(reason: string = 'unknown'): void {
   try {
     if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
   } catch {}
-  // bot.stop() signals the poll loop to end; the current getUpdates request
-  // may take up to its long-poll timeout to return. Force-exit after 2s.
-  setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(bot.stop()).finally(() => process.exit(0))
+  // Fire direct Telegram alert (bypasses the dead MCP path) BEFORE we tear
+  // down the bot. The alert has a 2s internal timeout per user (parallel).
+  // Hard exit after 4s total to bound shutdown latency.
+  setTimeout(() => process.exit(0), 4000)
+  void fireStallAlert(reason)
+    .finally(() => Promise.resolve(bot.stop()))
+    .finally(() => process.exit(0))
 }
 process.stdin.on('end', () => {
   log('mcp.stdin_end', {})
@@ -879,6 +941,49 @@ setInterval(() => {
     shutdown('orphan_watchdog')
   }
 }, 5000).unref()
+
+// Heartbeat tick — every 60s, log runtime state for forensic correlation
+// when the silent-stall fires. Captures stdout backpressure, memory pressure,
+// inbox growth, and the CC attention gap (delivered-but-unanswered count).
+setInterval(() => {
+  try {
+    const mem = process.memoryUsage()
+    const now = Date.now()
+    log('heartbeat.tick', {
+      uptime_ms: now - PLUGIN_START_TS,
+      writable_length: process.stdout.writableLength,
+      writable_high_water_mark: process.stdout.writableHighWaterMark,
+      writable_needs_drain: process.stdout.writableNeedDrain,
+      rss_mb: Math.round(mem.rss / 1024 / 1024),
+      heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024),
+      heap_total_mb: Math.round(mem.heapTotal / 1024 / 1024),
+      ppid: process.ppid,
+      polling_state: shuttingDown ? 'shutting_down' : (botUsername ? 'polling' : 'starting'),
+      last_tool_call_age_ms: lastToolCallTs ? now - lastToolCallTs : null,
+      last_inbound_age_ms: lastInboundTs ? now - lastInboundTs : null,
+      unanswered_inbound_age_ms: lastInboundDeliveredButUnanswered
+        ? now - lastInboundDeliveredButUnanswered.ts
+        : null,
+      unanswered_inbound_message_id: lastInboundDeliveredButUnanswered?.message_id ?? null,
+    })
+    // CC attention-gap detection — if inbound was delivered but no tool call
+    // has fired for >3 minutes, we're in the silent-stall state (CC not
+    // draining notifications).
+    if (lastInboundDeliveredButUnanswered) {
+      const gapMs = now - lastInboundDeliveredButUnanswered.ts
+      if (gapMs > 3 * 60 * 1000) {
+        log('cc_attention.gap', {
+          gap_ms: gapMs,
+          message_id: lastInboundDeliveredButUnanswered.message_id,
+          last_tool_call_age_ms: lastToolCallTs ? now - lastToolCallTs : null,
+          writable_length: process.stdout.writableLength,
+        })
+      }
+    }
+  } catch (err) {
+    log('heartbeat.error', { error: String(err) })
+  }
+}, 60000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
@@ -1184,7 +1289,8 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
+  const notificationStartTs = Date.now()
+  const notificationPromise = mcp.notification({
     method: 'notifications/claude/channel',
     params: {
       content: text,
@@ -1204,10 +1310,42 @@ async function handleInbound(
         } : {}),
       },
     },
-  }).then(() => {
-    log('inbound.delivered_to_mcp', { chat_id, message_id: msgId })
+  })
+
+  // Watchdog: if the notification promise hasn't resolved in 5s, that's the
+  // canonical silent-stall signature — write succeeded into the pipe but the
+  // host isn't draining fast enough. Log it without aborting the promise.
+  let unresolvedLogged = false
+  const unresolvedTimer = setTimeout(() => {
+    unresolvedLogged = true
+    log('mcp.notification.unresolved', {
+      chat_id,
+      message_id: msgId,
+      pending_ms: Date.now() - notificationStartTs,
+      writable_length: process.stdout.writableLength,
+    })
+  }, 5000)
+  unresolvedTimer.unref?.()
+
+  notificationPromise.then(() => {
+    clearTimeout(unresolvedTimer)
+    const now = Date.now()
+    log('inbound.delivered_to_mcp', {
+      chat_id,
+      message_id: msgId,
+      latency_ms: now - notificationStartTs,
+      was_unresolved: unresolvedLogged,
+    })
+    lastInboundTs = now
+    if (msgId != null) lastInboundDeliveredButUnanswered = { ts: now, message_id: msgId }
   }, err => {
-    log('inbound.delivered_to_mcp', { chat_id, message_id: msgId, error: String(err) })
+    clearTimeout(unresolvedTimer)
+    log('inbound.delivered_to_mcp', {
+      chat_id,
+      message_id: msgId,
+      latency_ms: Date.now() - notificationStartTs,
+      error: String(err),
+    })
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
   })
 }
