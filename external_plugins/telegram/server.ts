@@ -1223,7 +1223,8 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
+  const notificationStartTs = Date.now()
+  const notificationPromise = mcp.notification({
     method: 'notifications/claude/channel',
     params: {
       content: text,
@@ -1243,13 +1244,42 @@ async function handleInbound(
         } : {}),
       },
     },
-  }).then(() => {
-    log('inbound.delivered_to_mcp', { chat_id, message_id: msgId })
+  })
+
+  // Watchdog: if the notification promise hasn't resolved in 5s, that's the
+  // canonical silent-stall signature — write succeeded into the pipe but the
+  // host isn't draining fast enough. Log it without aborting the promise.
+  let unresolvedLogged = false
+  const unresolvedTimer = setTimeout(() => {
+    unresolvedLogged = true
+    log('mcp.notification.unresolved', {
+      chat_id,
+      message_id: msgId,
+      pending_ms: Date.now() - notificationStartTs,
+      writable_length: process.stdout.writableLength,
+    })
+  }, 5000)
+  unresolvedTimer.unref?.()
+
+  notificationPromise.then(() => {
+    clearTimeout(unresolvedTimer)
     const now = Date.now()
+    log('inbound.delivered_to_mcp', {
+      chat_id,
+      message_id: msgId,
+      latency_ms: now - notificationStartTs,
+      was_unresolved: unresolvedLogged,
+    })
     lastInboundTs = now
     if (msgId != null) lastInboundDeliveredButUnanswered = { ts: now, message_id: msgId }
   }, err => {
-    log('inbound.delivered_to_mcp', { chat_id, message_id: msgId, error: String(err) })
+    clearTimeout(unresolvedTimer)
+    log('inbound.delivered_to_mcp', {
+      chat_id,
+      message_id: msgId,
+      latency_ms: Date.now() - notificationStartTs,
+      error: String(err),
+    })
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
   })
 }
