@@ -137,6 +137,13 @@ openLog()
 // Flush any deferred env-loader events that fired before the log was open.
 for (const e of envLoadEvents) log(e.event, e.fields)
 log('plugin.start', { pid: process.pid, ppid: process.ppid })
+
+// Liveness state — used by heartbeat tick, stall-alert path, and gap detection.
+const PLUGIN_START_TS = Date.now()
+let lastToolCallTs: number = 0
+let lastInboundTs: number = 0
+let lastInboundDeliveredButUnanswered: { ts: number; message_id: number } | null = null
+
 process.on('exit', code => {
   if (logFd != null) {
     try {
@@ -663,10 +670,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
+  const _now = Date.now()
   log('tool_call.entry', {
     tool: req.params.name,
     chat_id: typeof args.chat_id === 'string' ? args.chat_id : undefined,
   })
+  lastToolCallTs = _now
+  lastInboundDeliveredButUnanswered = null
   try {
     switch (req.params.name) {
       case 'reply': {
@@ -1206,6 +1216,9 @@ async function handleInbound(
     },
   }).then(() => {
     log('inbound.delivered_to_mcp', { chat_id, message_id: msgId })
+    const now = Date.now()
+    lastInboundTs = now
+    if (msgId != null) lastInboundDeliveredButUnanswered = { ts: now, message_id: msgId }
   }, err => {
     log('inbound.delivered_to_mcp', { chat_id, message_id: msgId, error: String(err) })
     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)

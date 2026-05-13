@@ -75,4 +75,16 @@ if ! awk 'NF { if (!match($0, /"ts":[0-9]+/) || !match($0, /"event":"[^"]+"/)) e
   exit 1
 fi
 
+# Requires Task 1.2's heartbeat.tick setInterval to be in place — will fail until then.
+# Verify heartbeat fires within 75 seconds of start
+echo "--- waiting for first heartbeat.tick (max 75s) ---"
+for i in $(seq 1 75); do
+  if grep -q '"event":"heartbeat.tick"' "$SMOKE_DIR/plugin.log"; then
+    echo "heartbeat seen at $i seconds"
+    break
+  fi
+  sleep 1
+done
+grep -q '"event":"heartbeat.tick"' "$SMOKE_DIR/plugin.log" || { echo "FAIL: no heartbeat.tick in 75s"; exit 1; }
+
 echo "PASS: $(wc -l < "$LOG") events logged, all required events present"
