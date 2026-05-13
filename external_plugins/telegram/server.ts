@@ -890,6 +890,35 @@ setInterval(() => {
   }
 }, 5000).unref()
 
+// Heartbeat tick — every 60s, log runtime state for forensic correlation
+// when the silent-stall fires. Captures stdout backpressure, memory pressure,
+// inbox growth, and the CC attention gap (delivered-but-unanswered count).
+setInterval(() => {
+  try {
+    const mem = process.memoryUsage()
+    const now = Date.now()
+    log('heartbeat.tick', {
+      uptime_ms: now - PLUGIN_START_TS,
+      writable_length: process.stdout.writableLength,
+      writable_high_water_mark: process.stdout.writableHighWaterMark,
+      writable_needs_drain: process.stdout.writableNeedDrain,
+      rss_mb: Math.round(mem.rss / 1024 / 1024),
+      heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024),
+      heap_total_mb: Math.round(mem.heapTotal / 1024 / 1024),
+      ppid: process.ppid,
+      polling_state: shuttingDown ? 'shutting_down' : (botUsername ? 'polling' : 'starting'),
+      last_tool_call_age_ms: lastToolCallTs ? now - lastToolCallTs : null,
+      last_inbound_age_ms: lastInboundTs ? now - lastInboundTs : null,
+      unanswered_inbound_age_ms: lastInboundDeliveredButUnanswered
+        ? now - lastInboundDeliveredButUnanswered.ts
+        : null,
+      unanswered_inbound_message_id: lastInboundDeliveredButUnanswered?.message_id ?? null,
+    })
+  } catch (err) {
+    log('heartbeat.error', { error: String(err) })
+  }
+}, 60000).unref()
+
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
 // /status to other group members, (2) confirm bot presence in non-allowlisted
 // groups, (3) spam channels the operator never approved. Silent drop matches
