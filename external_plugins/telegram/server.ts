@@ -914,6 +914,20 @@ setInterval(() => {
         : null,
       unanswered_inbound_message_id: lastInboundDeliveredButUnanswered?.message_id ?? null,
     })
+    // CC attention-gap detection — if inbound was delivered but no tool call
+    // has fired for >3 minutes, we're in the silent-stall state (CC not
+    // draining notifications).
+    if (lastInboundDeliveredButUnanswered) {
+      const gapMs = now - lastInboundDeliveredButUnanswered.ts
+      if (gapMs > 3 * 60 * 1000) {
+        log('cc_attention.gap', {
+          gap_ms: gapMs,
+          message_id: lastInboundDeliveredButUnanswered.message_id,
+          last_tool_call_age_ms: lastToolCallTs ? now - lastToolCallTs : null,
+          writable_length: process.stdout.writableLength,
+        })
+      }
+    }
   } catch (err) {
     log('heartbeat.error', { error: String(err) })
   }
